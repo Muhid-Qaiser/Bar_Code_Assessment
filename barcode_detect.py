@@ -14,24 +14,7 @@ class BarcodeRegion:
     bbox: tuple[int, int, int, int]
     min_area_rect: tuple
     box_points: np.ndarray
-    angle: float
     score: float
-
-    @property
-    def x(self) -> int:
-        return self.bbox[0]
-
-    @property
-    def y(self) -> int:
-        return self.bbox[1]
-
-    @property
-    def width(self) -> int:
-        return self.bbox[2]
-
-    @property
-    def height(self) -> int:
-        return self.bbox[3]
 
 
 def _adaptive_threshold(gradient: np.ndarray) -> np.ndarray:
@@ -141,7 +124,7 @@ def detect_barcode_regions(
             continue
 
         rect = cv2.minAreaRect(contour)
-        _, (rect_w, rect_h), angle = rect
+        _, (rect_w, rect_h), _ = rect
         short_side = min(rect_w, rect_h)
         long_side = max(rect_w, rect_h)
         if short_side < min_short_side:
@@ -175,7 +158,6 @@ def detect_barcode_regions(
                 bbox=(x1, y1, x2 - x1, y2 - y1),
                 min_area_rect=rect,
                 box_points=box_points,
-                angle=angle,
                 score=area * extent,
             )
         )
@@ -198,20 +180,8 @@ def _is_valid_crop(crop: np.ndarray, min_std: float = 10.0, max_mean: float = 24
     return float(np.std(gray)) >= min_std and float(np.mean(gray)) <= max_mean
 
 
-def crop_barcode(
-    image: np.ndarray,
-    region: BarcodeRegion,
-    pad_px: int = 12,
-) -> np.ndarray | None:
-    """
-    Tight rotated crop using warpAffine on the full image.
-
-    Rotates the whole image by the barcode angle (around the barcode
-    centre), then takes a simple axis-aligned slice.  Because the
-    rotation is applied to the whole image first, no pixel is ever
-    sampled outside the original frame — eliminating the blank-white
-    artefacts that the previous perspective-warp approach produced.
-    """
+def crop_barcode(image: np.ndarray, region: BarcodeRegion, pad_px: int = 12) -> np.ndarray | None:
+    """Rotate image to straighten barcode, then slice a tight axis-aligned crop."""
     ih, iw = image.shape[:2]
     center, (rect_w, rect_h), angle = region.min_area_rect
 

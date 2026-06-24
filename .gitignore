@@ -1,6 +1,6 @@
 .env
+*.pyc
 tagss/
 cropped/
 debug/
-_test_*.py
-*.pyc
+__pycache__/
