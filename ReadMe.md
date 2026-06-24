@@ -60,3 +60,84 @@ pip install -r requirements.txt
 - Python 3.10+
 - OpenCV, NumPy, matplotlib, pandas, pyzbar, Pillow
 
+## Proposed Solution and Thought Processes
+
+My goal was to take already-cropped barcode images with unknown rotation and return two things: the correct decoded value, and an image that looks properly upright. I did not want to train a model. Barcodes are a good fit for classic image processing because they are just repeating parallel lines with strong light-dark contrast in one direction.
+
+I built my main workflow in `main.ipynb` around manually cropped images in `manual_cropping/`. Each image may be tilted, sideways, or upside down. The job is to straighten it, read it, and save a clean upright version.
+
+### High-Level Approach
+
+At a high level, I split the problem into two steps.
+
+**Orienting** means figuring out how much to rotate the image so the barcode lines are straight and the label reads the right way up, not just readable.
+
+**Decoding** means passing the image to pyzbar and reading the barcode value.
+
+The important insight is that these two steps are linked. pyzbar can often decode a barcode even when it is rotated, so getting the text right does not automatically mean the image looks correct. I needed both: a valid decode and a visually upright output.
+
+### How the Solution Evolved
+
+I started with the most direct idea: find the barcode shape in the crop, rotate it to straighten the lines, then send it to pyzbar. That worked for decoding on many images, but several still looked wrong even when the text was correct. I improved the pipeline step by step rather than replacing it entirely.
+
+#### **Orientation**
+
+**What I tried first**
+
+I used OpenCV `minAreaRect` on a barcode contour to estimate the tilt angle, then `warpAffine` to deskew the crop. After straightening, I tested rotations of 0, 90, 180, and 270 degrees and kept the first decode that pyzbar accepted.
+
+**Why I picked this**
+
+`minAreaRect` is a standard way to measure rotated rectangles. 1D barcodes only need to be axis-aligned for reading, so deskew plus a few right-angle rotations felt like the right lightweight approach.
+
+**What went wrong**
+
+Two problems showed up quickly.
+
+First, the contour I used for deskewing was not reliable. A single wide morphological kernel `(21, 7)` bridged the barcode stripes with human-readable text below the bars. The detected shape was too large and the deskew angle was off.
+
+Second, pyzbar does not care about visual upright. It can return the correct string while the saved image is still sideways or upside down. Stopping at the first successful decode was not enough.
+
+**What I changed**
+
+To isolate the stripes more accurately, I built a gradient mask with Scharr filters and used two narrower kernels, `(25, 5)` and `(5, 25)`, then merged them. Horizontal and vertical bar layouts are both covered, but nearby text is less likely to be pulled into the mask.
+
+`minAreaRect` also has a known 90 degree ambiguity on near-square regions. I added multiple deskew candidates and tested them instead of trusting the first angle only.
+
+For visual upright output, I used pyzbar's own `orientation` metadata (`UP`, `DOWN`, `LEFT`, `RIGHT`) to apply one final correction rotation after decode. I tested all four cardinal angles on the deskewed image and chose the result that needed the smallest total rotation.
+
+When contour-based deskew still failed, I kept a fallback brute-force search from -90 to 90 degrees in 5 degree steps, again preferring the least rotation.
+
+**What I tried later but reverted**
+
+I experimented with Hough line detection to estimate barcode angle faster during fallback search, and with extra preprocessing such as adaptive thresholding. On my 27 manual crops, these changes made orientation worse, not better. I reverted to the simpler contour deskew plus cardinal testing plus pyzbar orientation correction, which gave the best visual results.
+
+#### **Decoding**
+
+**What I tried first**
+
+I passed the deskewed grayscale image directly to `pyzbar.decode()`.
+
+**Why I picked pyzbar**
+
+It is a mature barcode library, works well on classical 1D formats, and exposes orientation metadata that I could reuse for upright correction. That made it a better fit than treating decode and orient as fully separate problems.
+
+**What went wrong**
+
+Direct decode was enough on clean crops, but it failed on images with low contrast, uneven lighting, blur, or very small barcodes.
+
+**What I changed**
+
+Before giving up on an image, I now try a short list of preprocessing variants in order:
+
+- raw grayscale
+- CLAHE for local contrast
+- Otsu binarisation for noisy or washed-out images
+- upscaling at 1.5x and 2.0x for small barcodes
+
+The pipeline stops at the first variant pyzbar can read. This improved recall without changing the orientation logic itself.
+
+### Results
+
+On my manual crop set in `manual_cropping/` (27 images), the final orient and decode pipeline decodes every image and produces visually upright barcodes with vertical bars. The main lesson for me was that decode success and visual correctness are not the same problem, and the final solution needed both geometric deskewing and pyzbar's orientation signal to get consistent upright outputs.
+
