@@ -30,6 +30,7 @@ def _adaptive_threshold(gradient: np.ndarray) -> np.ndarray:
 
 def _build_barcode_mask(blurred: np.ndarray) -> np.ndarray:
     """Highlight barcode-like parallel line patterns in any orientation."""
+    # Gradient keeps regions with strong contrast in one direction.
     grad_x = cv2.convertScaleAbs(cv2.Scharr(blurred, cv2.CV_32F, 1, 0))
     grad_y = cv2.convertScaleAbs(cv2.Scharr(blurred, cv2.CV_32F, 0, 1))
 
@@ -39,7 +40,7 @@ def _build_barcode_mask(blurred: np.ndarray) -> np.ndarray:
 
     thresh = _adaptive_threshold(combined)
 
-    # Bridge gaps between parallel barcode lines for each orientation.
+    # Morphology closes gaps between stripes then merges both orientations.
     kernels = [
         cv2.getStructuringElement(cv2.MORPH_RECT, (21, 7)),
         cv2.getStructuringElement(cv2.MORPH_RECT, (7, 21)),
@@ -58,6 +59,7 @@ def _build_barcode_mask(blurred: np.ndarray) -> np.ndarray:
 
 
 def _nms(regions: list[BarcodeRegion], overlap_thresh: float = 0.4) -> list[BarcodeRegion]:
+    """Drop overlapping detections, keeping the highest-scoring box."""
     if not regions:
         return []
 
@@ -106,16 +108,20 @@ def detect_barcode_regions(
     height, width = image.shape[:2]
     image_area = height * width
 
+    # Preprocess grayscale blur and gradient map.
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (blur_ksize, blur_ksize), 0)
 
     grad_x = cv2.convertScaleAbs(cv2.Scharr(blurred, cv2.CV_32F, 1, 0))
     grad_y = cv2.convertScaleAbs(cv2.Scharr(blurred, cv2.CV_32F, 0, 1))
+    # Barcode stripes have strong gradient in one axis only.
     gradient = cv2.max(cv2.subtract(grad_x, grad_y), cv2.subtract(grad_y, grad_x))
 
+    # Build mask and find candidate contours.
     mask = _build_barcode_mask(blurred)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+    # Filter contours by size shape and gradient strength.
     regions: list[BarcodeRegion] = []
     for contour in contours:
         area = cv2.contourArea(contour)
@@ -139,7 +145,7 @@ def detect_barcode_regions(
         if extent < min_extent:
             continue
 
-        # Require strong barcode-like gradients inside the contour.
+        # Require strong barcode like gradients inside the contour.
         contour_mask = np.zeros((height, width), dtype=np.uint8)
         cv2.drawContours(contour_mask, [contour], -1, 255, -1)
         mean_gradient = cv2.mean(gradient, mask=contour_mask)[0]
@@ -181,18 +187,18 @@ def _is_valid_crop(crop: np.ndarray, min_std: float = 10.0, max_mean: float = 24
 
 
 def crop_barcode(image: np.ndarray, region: BarcodeRegion, pad_px: int = 12) -> np.ndarray | None:
-    """Rotate image to straighten barcode, then slice a tight axis-aligned crop."""
+    """Rotate to straighten, then axis-aligned slice (avoids perspective warp clipping)."""
     ih, iw = image.shape[:2]
     center, (rect_w, rect_h), angle = region.min_area_rect
 
-    # Normalise so the *long* axis always becomes horizontal after rotation.
+    # Normalise so the long axis becomes horizontal after rotation.
     if rect_w < rect_h:
         angle += 90.0
         rect_w, rect_h = rect_h, rect_w
 
     cx, cy = float(center[0]), float(center[1])
 
-    # Rotation matrix that keeps the full image in frame.
+    # Rotate full image so barcode bars are axis aligned.
     M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
     cos_a = abs(M[0, 0])
     sin_a = abs(M[0, 1])
@@ -208,7 +214,7 @@ def crop_barcode(image: np.ndarray, region: BarcodeRegion, pad_px: int = 12) -> 
         borderMode=cv2.BORDER_REPLICATE,
     )
 
-    # Centre of the barcode in the rotated frame.
+    # Slice tight crop around rotated barcode centre.
     new_cx = M[0, 0] * cx + M[0, 1] * cy + M[0, 2]
     new_cy = M[1, 0] * cx + M[1, 1] * cy + M[1, 2]
 
@@ -265,11 +271,12 @@ def process_image(
     barcodes = []
     stem = Path(source_name).stem
 
+    # Crop each detection then orient and decode.
     saved_index = 0
     for region in regions:
         crop = crop_barcode(image, region)
         if crop is None:
-            continue  # blank / invalid crop — skip entirely
+            continue  # skip blank or invalid crop
 
         crop_path = output_dir / f"{stem}_barcode_{saved_index:02d}.jpg"
         cv2.imwrite(str(crop_path), crop)
@@ -287,6 +294,7 @@ def process_image(
         if decode:
             from barcode_orient_decode import DecodeResult, decode_barcode, orient_and_decode
 
+            # Fast path decode as is, orient only if deskew is needed.
             decoded_list = decode_barcode(crop)
             if decoded_list:
                 item = decoded_list[0]
@@ -346,6 +354,7 @@ def process_folder(
         p for p in input_dir.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}
     )
 
+    # Run pipeline on every image in the folder.
     for image_path in image_paths:
         image = cv2.imread(str(image_path))
         if image is None:

@@ -20,7 +20,7 @@ class DecodeResult:
     contour: np.ndarray | None = None
 
 
-# ZBar orientation → rotation to make barcode upright (bars vertical, text at bottom).
+# ZBar orientation to extra rotation for upright barcode.
 _ROTATION_TO_UP = {
     "UP": 0.0,
     "RIGHT": -90.0,
@@ -34,6 +34,7 @@ def _rotate_image(image: np.ndarray, angle: float, expand: bool = True) -> np.nd
     center = (width / 2, height / 2)
     matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
 
+    # Expand canvas so rotated image is not clipped.
     if expand:
         cos = abs(matrix[0, 0])
         sin = abs(matrix[0, 1])
@@ -56,6 +57,7 @@ def _rotate_image(image: np.ndarray, angle: float, expand: bool = True) -> np.nd
 
 def _barcode_mask(gray: np.ndarray) -> np.ndarray:
     """Binary mask of barcode stripes (narrow kernels avoid merging text below bars)."""
+    # Gradient and threshold to isolate stripe regions.
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     grad_x = cv2.convertScaleAbs(cv2.Scharr(blurred, cv2.CV_32F, 1, 0))
     grad_y = cv2.convertScaleAbs(cv2.Scharr(blurred, cv2.CV_32F, 0, 1))
@@ -63,8 +65,9 @@ def _barcode_mask(gray: np.ndarray) -> np.ndarray:
 
     _, thresh = cv2.threshold(gradient, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
 
+    # Close stripe gaps per orientation then merge.
     masks = []
-    for kw, kh in ((25, 5), (5, 25)):
+    for kw, kh in ((25, 5), (5, 25)):  # horizontal and vertical bar layouts
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kw, kh))
         masks.append(cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel))
 
@@ -86,13 +89,14 @@ def find_barcode_contour(image: np.ndarray) -> np.ndarray | None:
 
 
 def _correct_min_area_angle(angle: float) -> float:
+    # minAreaRect angles from -90 to 0, convert to deskew rotation.
     if angle < -45:
         return -(90 + angle)
     return -angle
 
 
 def _deskew_candidates(contour: np.ndarray) -> list[float]:
-    """Deskew angle candidates (handles minAreaRect 90° ambiguity)."""
+    """Deskew angle candidates, handles minAreaRect 90 degree ambiguity."""
     rect = cv2.minAreaRect(contour)
     angle = _correct_min_area_angle(rect[-1])
     w, h = rect[1]
@@ -100,7 +104,7 @@ def _deskew_candidates(contour: np.ndarray) -> list[float]:
         return [angle]
 
     candidates = [angle]
-    if min(w, h) / max(w, h) > 0.55:
+    if min(w, h) / max(w, h) > 0.55:  # near square 90 degree ambiguity
         candidates.extend([angle + 90.0, angle - 90.0])
     return candidates
 
@@ -119,9 +123,11 @@ def straighten_barcode(
 
 
 def _preprocess_variants(image: np.ndarray) -> list[np.ndarray]:
+    """Build image variants to improve pyzbar decode on hard crops."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
     variants = [gray]
 
+    # Contrast boost binarisation and upscaling for small or blurry barcodes.
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     variants.append(clahe.apply(gray))
 
@@ -136,6 +142,7 @@ def _preprocess_variants(image: np.ndarray) -> list[np.ndarray]:
 
 
 def decode_barcode(image: np.ndarray) -> list:
+    # Try each preprocess variant until pyzbar succeeds.
     for variant in _preprocess_variants(image):
         results = decode(variant)
         if results:
@@ -164,6 +171,7 @@ def _decode_upright(image: np.ndarray, deskew_angle: float, raw_image: np.ndarra
     best: DecodeResult | None = None
     best_score = float("inf")
 
+    # Test 0 90 180 270 degrees with pyzbar orientation correction.
     for cardinal in (0, 90, 180, 270):
         rotated = image if cardinal == 0 else _rotate_image(image, cardinal)
         decoded = decode_barcode(rotated)
@@ -172,7 +180,7 @@ def _decode_upright(image: np.ndarray, deskew_angle: float, raw_image: np.ndarra
 
         result = _make_upright(rotated, decoded[0], deskew_angle, cardinal, raw_image)
         orientation = getattr(decoded[0], "orientation", "UP")
-        score = abs(_ROTATION_TO_UP.get(orientation, 0.0)) + abs(cardinal) * 0.1
+        score = abs(_ROTATION_TO_UP.get(orientation, 0.0)) + abs(cardinal) * 0.1  # least rotation wins
 
         if score < best_score:
             best_score = score
@@ -182,6 +190,7 @@ def _decode_upright(image: np.ndarray, deskew_angle: float, raw_image: np.ndarra
 
 
 def _fallback_angle_search(image: np.ndarray) -> DecodeResult | None:
+    """Brute force sweep from -90 to 90 degrees when contour deskew fails."""
     best: DecodeResult | None = None
     best_score = float("inf")
 
@@ -210,6 +219,7 @@ def orient_and_decode(image: np.ndarray) -> DecodeResult | None:
     if contour is None:
         return _fallback_angle_search(image)
 
+    # Try each deskew candidate and keep the result needing least rotation.
     best: DecodeResult | None = None
     best_score = float("inf")
 
@@ -219,7 +229,7 @@ def orient_and_decode(image: np.ndarray) -> DecodeResult | None:
         if result is None:
             continue
 
-        if abs(result.rotation_angle) < best_score:
+        if abs(result.rotation_angle) < best_score:  # pick smallest total rotation
             best_score = abs(result.rotation_angle)
             result.contour = contour
             best = result
@@ -227,6 +237,7 @@ def orient_and_decode(image: np.ndarray) -> DecodeResult | None:
     if best is not None:
         return best
 
+    # Contour found but decode failed, fall back to angle search.
     fallback = _fallback_angle_search(image)
     if fallback is not None:
         fallback.contour = contour
