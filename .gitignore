@@ -1,0 +1,5 @@
+.env
+tagss/
+cropped/
+debug/
+_test_*.py
