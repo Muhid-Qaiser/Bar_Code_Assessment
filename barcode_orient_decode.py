@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 
 import cv2
 import numpy as np
@@ -19,6 +18,15 @@ class DecodeResult:
     oriented_image: np.ndarray
     raw_image: np.ndarray
     contour: np.ndarray | None = None
+
+
+# ZBar orientation → rotation to make barcode upright (bars vertical, text at bottom).
+_ROTATION_TO_UP = {
+    "UP": 0.0,
+    "RIGHT": -90.0,
+    "DOWN": 180.0,
+    "LEFT": 90.0,
+}
 
 
 def _rotate_image(image: np.ndarray, angle: float, expand: bool = True) -> np.ndarray:
@@ -47,24 +55,28 @@ def _rotate_image(image: np.ndarray, angle: float, expand: bool = True) -> np.nd
 
 
 def _barcode_mask(gray: np.ndarray) -> np.ndarray:
-    """Build a binary mask of barcode-like parallel line regions."""
+    """Binary mask of barcode stripes (narrow kernels avoid merging text below bars)."""
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     grad_x = cv2.convertScaleAbs(cv2.Scharr(blurred, cv2.CV_32F, 1, 0))
     grad_y = cv2.convertScaleAbs(cv2.Scharr(blurred, cv2.CV_32F, 0, 1))
     gradient = cv2.max(cv2.subtract(grad_x, grad_y), cv2.subtract(grad_y, grad_x))
 
     _, thresh = cv2.threshold(gradient, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 7))
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+
+    masks = []
+    for kw, kh in ((25, 5), (5, 25)):
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kw, kh))
+        masks.append(cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel))
+
+    merged = cv2.bitwise_or(masks[0], masks[1])
     return cv2.morphologyEx(
-        closed,
+        merged,
         cv2.MORPH_OPEN,
         cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
     )
 
 
 def find_barcode_contour(image: np.ndarray) -> np.ndarray | None:
-    """Find the largest barcode-like contour inside a cropped ROI."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
     mask = _barcode_mask(gray)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -74,28 +86,36 @@ def find_barcode_contour(image: np.ndarray) -> np.ndarray | None:
 
 
 def _correct_min_area_angle(angle: float) -> float:
-    """Convert minAreaRect angle into a deskew rotation."""
     if angle < -45:
         return -(90 + angle)
     return -angle
 
 
-def straighten_barcode(cropped_image: np.ndarray, contour: np.ndarray | None = None) -> tuple[np.ndarray, float, np.ndarray | None]:
-    """
-    Phase 2: straighten a cropped barcode using minAreaRect + warpAffine.
+def _deskew_candidates(contour: np.ndarray) -> list[float]:
+    """Deskew angle candidates (handles minAreaRect 90° ambiguity)."""
+    rect = cv2.minAreaRect(contour)
+    angle = _correct_min_area_angle(rect[-1])
+    w, h = rect[1]
+    if max(w, h) < 1:
+        return [angle]
 
-    1D barcodes only need to be axis-aligned (horizontal or vertical bars).
-    Pyzbar can read them upside down; they do not need text at the bottom.
-    """
+    candidates = [angle]
+    if min(w, h) / max(w, h) > 0.55:
+        candidates.extend([angle + 90.0, angle - 90.0])
+    return candidates
+
+
+def straighten_barcode(
+    cropped_image: np.ndarray,
+    contour: np.ndarray | None = None,
+) -> tuple[np.ndarray, float, np.ndarray | None]:
     if contour is None:
         contour = find_barcode_contour(cropped_image)
     if contour is None:
         return cropped_image.copy(), 0.0, None
 
-    rect = cv2.minAreaRect(contour)
-    angle = _correct_min_area_angle(rect[-1])
-    straightened = _rotate_image(cropped_image, angle, expand=True)
-    return straightened, angle, contour
+    angle = _deskew_candidates(contour)[0]
+    return _rotate_image(cropped_image, angle, expand=True), angle, contour
 
 
 def _preprocess_variants(image: np.ndarray) -> list[np.ndarray]:
@@ -116,65 +136,98 @@ def _preprocess_variants(image: np.ndarray) -> list[np.ndarray]:
 
 
 def decode_barcode(image: np.ndarray) -> list:
-    """Phase 3: decode a straightened barcode image with pyzbar."""
-    results = []
     for variant in _preprocess_variants(image):
-        results.extend(decode(variant))
+        results = decode(variant)
         if results:
             return results
-    return results
+    return []
 
 
-def _decode_with_cardinals(image: np.ndarray, base_angle: float) -> DecodeResult | None:
-    """Try straightened image at 0/90/180/270 degrees (axis-aligned is enough)."""
+def _make_upright(rotated: np.ndarray, item, deskew_angle: float, cardinal: float, raw_image: np.ndarray) -> DecodeResult:
+    """Build result with image rotated to visual upright using pyzbar orientation."""
+    orientation = getattr(item, "orientation", "UP")
+    correction = _ROTATION_TO_UP.get(orientation, 0.0)
+    upright = _rotate_image(rotated, correction) if correction else rotated
+
+    return DecodeResult(
+        text=item.data.decode("utf-8"),
+        barcode_type=item.type,
+        rotation_angle=deskew_angle + cardinal + correction,
+        deskew_angle=deskew_angle,
+        oriented_image=upright,
+        raw_image=raw_image,
+    )
+
+
+def _decode_upright(image: np.ndarray, deskew_angle: float, raw_image: np.ndarray) -> DecodeResult | None:
+    """Try cardinals on deskewed image; rotate each hit to upright via pyzbar orientation."""
+    best: DecodeResult | None = None
+    best_score = float("inf")
+
     for cardinal in (0, 90, 180, 270):
-        oriented = image if cardinal == 0 else _rotate_image(image, cardinal)
-        decoded = decode_barcode(oriented)
-        if decoded:
-            item = decoded[0]
-            return DecodeResult(
-                text=item.data.decode("utf-8"),
-                barcode_type=item.type,
-                rotation_angle=base_angle + cardinal,
-                deskew_angle=base_angle,
-                oriented_image=oriented,
-                raw_image=image,
-            )
-    return None
+        rotated = image if cardinal == 0 else _rotate_image(image, cardinal)
+        decoded = decode_barcode(rotated)
+        if not decoded:
+            continue
+
+        result = _make_upright(rotated, decoded[0], deskew_angle, cardinal, raw_image)
+        orientation = getattr(decoded[0], "orientation", "UP")
+        score = abs(_ROTATION_TO_UP.get(orientation, 0.0)) + abs(cardinal) * 0.1
+
+        if score < best_score:
+            best_score = score
+            best = result
+
+    return best
 
 
 def _fallback_angle_search(image: np.ndarray) -> DecodeResult | None:
-    """Fallback if minAreaRect deskew alone is not enough."""
+    best: DecodeResult | None = None
+    best_score = float("inf")
+
     for angle in range(-90, 91, 5):
         rotated = _rotate_image(image, angle)
         for flip in (0, 180):
-            oriented = rotated if flip == 0 else _rotate_image(rotated, 180)
-            decoded = decode_barcode(oriented)
-            if decoded:
-                item = decoded[0]
-                return DecodeResult(
-                    text=item.data.decode("utf-8"),
-                    barcode_type=item.type,
-                    rotation_angle=angle + flip,
-                    deskew_angle=angle,
-                    oriented_image=oriented,
-                    raw_image=image,
-                )
-    return None
+            candidate = rotated if flip == 0 else _rotate_image(rotated, 180)
+            decoded = decode_barcode(candidate)
+            if not decoded:
+                continue
+
+            result = _make_upright(candidate, decoded[0], angle, flip, image)
+            orientation = getattr(decoded[0], "orientation", "UP")
+            score = abs(angle) + abs(flip) + abs(_ROTATION_TO_UP.get(orientation, 0.0))
+
+            if score < best_score:
+                best_score = score
+                best = result
+
+    return best
 
 
 def orient_and_decode(image: np.ndarray) -> DecodeResult | None:
-    """Run Phase 2 straightening, then Phase 3 decoding."""
-    straightened, deskew_angle, contour = straighten_barcode(image)
+    """Deskew, decode, and return a visually upright barcode image."""
+    contour = find_barcode_contour(image)
+    if contour is None:
+        return _fallback_angle_search(image)
 
-    result = _decode_with_cardinals(straightened, deskew_angle)
-    if result is not None:
-        result.raw_image = image
-        result.contour = contour
-        return result
+    best: DecodeResult | None = None
+    best_score = float("inf")
+
+    for deskew_angle in _deskew_candidates(contour):
+        straightened = _rotate_image(image, deskew_angle, expand=True)
+        result = _decode_upright(straightened, deskew_angle, image)
+        if result is None:
+            continue
+
+        if abs(result.rotation_angle) < best_score:
+            best_score = abs(result.rotation_angle)
+            result.contour = contour
+            best = result
+
+    if best is not None:
+        return best
 
     fallback = _fallback_angle_search(image)
     if fallback is not None:
         fallback.contour = contour
     return fallback
-
