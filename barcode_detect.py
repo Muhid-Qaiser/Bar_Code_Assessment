@@ -109,6 +109,7 @@ def detect_barcode_regions(
     min_aspect: float = 1.4,
     max_aspect: float = 6.0,
     min_extent: float = 0.30,
+    min_gradient: float = 18.0,
     padding: int = 15,
 ) -> tuple[list[BarcodeRegion], dict[str, np.ndarray]]:
     """
@@ -159,7 +160,7 @@ def detect_barcode_regions(
         contour_mask = np.zeros((height, width), dtype=np.uint8)
         cv2.drawContours(contour_mask, [contour], -1, 255, -1)
         mean_gradient = cv2.mean(gradient, mask=contour_mask)[0]
-        if mean_gradient < 18:
+        if mean_gradient < min_gradient:
             continue
 
         box_points = cv2.boxPoints(rect).astype(np.int32)
@@ -187,53 +188,73 @@ def detect_barcode_regions(
     return _nms(regions), debug
 
 
-def _order_box_points(box: np.ndarray) -> np.ndarray:
-    """Order corners: top-left, top-right, bottom-right, bottom-left."""
-    box = box.astype(np.float32)
-    s = box.sum(axis=1)
-    diff = np.diff(box, axis=1).reshape(-1)
-    ordered = np.zeros((4, 2), dtype=np.float32)
-    ordered[0] = box[np.argmin(s)]
-    ordered[2] = box[np.argmax(s)]
-    ordered[1] = box[np.argmin(diff)]
-    ordered[3] = box[np.argmax(diff)]
-    return ordered
+def _is_valid_crop(crop: np.ndarray, min_std: float = 10.0, max_mean: float = 242.0) -> bool:
+    """Return False if crop is blank/near-uniform (likely a white patch or noise)."""
+    if crop is None or crop.size == 0:
+        return False
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+    if gray.shape[0] < 20 or gray.shape[1] < 20:
+        return False
+    return float(np.std(gray)) >= min_std and float(np.mean(gray)) <= max_mean
 
 
-def crop_barcode_rotated(
+def crop_barcode(
     image: np.ndarray,
     region: BarcodeRegion,
-    pad_ratio: float = 0.10,
-) -> np.ndarray:
-    """Tight crop via minAreaRect perspective warp (better for tilted barcodes)."""
-    center, (rect_w, rect_h), angle = region.min_area_rect
-    rect_w = max(rect_w, 1.0) * (1.0 + pad_ratio)
-    rect_h = max(rect_h, 1.0) * (1.0 + pad_ratio)
+    pad_px: int = 12,
+) -> np.ndarray | None:
+    """
+    Tight rotated crop using warpAffine on the full image.
 
-    box = cv2.boxPoints(((center[0], center[1]), (rect_w, rect_h), angle))
-    src = _order_box_points(box)
-    dst_w, dst_h = int(rect_w), int(rect_h)
-    dst = np.array(
-        [[0, 0], [dst_w - 1, 0], [dst_w - 1, dst_h - 1], [0, dst_h - 1]],
-        dtype=np.float32,
-    )
-    matrix = cv2.getPerspectiveTransform(src, dst)
-    return cv2.warpPerspective(
-        image,
-        matrix,
-        (dst_w, dst_h),
+    Rotates the whole image by the barcode angle (around the barcode
+    centre), then takes a simple axis-aligned slice.  Because the
+    rotation is applied to the whole image first, no pixel is ever
+    sampled outside the original frame — eliminating the blank-white
+    artefacts that the previous perspective-warp approach produced.
+    """
+    ih, iw = image.shape[:2]
+    center, (rect_w, rect_h), angle = region.min_area_rect
+
+    # Normalise so the *long* axis always becomes horizontal after rotation.
+    if rect_w < rect_h:
+        angle += 90.0
+        rect_w, rect_h = rect_h, rect_w
+
+    cx, cy = float(center[0]), float(center[1])
+
+    # Rotation matrix that keeps the full image in frame.
+    M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
+    cos_a = abs(M[0, 0])
+    sin_a = abs(M[0, 1])
+    new_w = int(ih * sin_a + iw * cos_a)
+    new_h = int(ih * cos_a + iw * sin_a)
+    # Shift origin so nothing is clipped.
+    M[0, 2] += new_w / 2.0 - cx
+    M[1, 2] += new_h / 2.0 - cy
+
+    rotated = cv2.warpAffine(
+        image, M, (new_w, new_h),
         flags=cv2.INTER_CUBIC,
         borderMode=cv2.BORDER_REPLICATE,
     )
 
+    # Centre of the barcode in the rotated frame.
+    new_cx = M[0, 0] * cx + M[0, 1] * cy + M[0, 2]
+    new_cy = M[1, 0] * cx + M[1, 1] * cy + M[1, 2]
 
-def crop_barcode(image: np.ndarray, region: BarcodeRegion) -> np.ndarray:
-    """Crop a barcode ROI — prefers rotated perspective crop, falls back to bbox."""
-    try:
-        return crop_barcode_rotated(image, region)
-    except cv2.error:
-        x, y, w, h = region.bbox
-        return image[y : y + h, x : x + w].copy()
+    half_w = rect_w / 2.0 + pad_px
+    half_h = rect_h / 2.0 + pad_px
+
+    x1 = max(0, int(new_cx - half_w))
+    y1 = max(0, int(new_cy - half_h))
+    x2 = min(new_w, int(new_cx + half_w))
+    y2 = min(new_h, int(new_cy + half_h))
+
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    crop = rotated[y1:y2, x1:x2].copy()
+    return crop if _is_valid_crop(crop) else None
 
 
 def draw_detections(
@@ -274,13 +295,17 @@ def process_image(
     barcodes = []
     stem = Path(source_name).stem
 
-    for index, region in enumerate(regions):
+    saved_index = 0
+    for region in regions:
         crop = crop_barcode(image, region)
-        crop_path = output_dir / f"{stem}_barcode_{index:02d}.jpg"
+        if crop is None:
+            continue  # blank / invalid crop — skip entirely
+
+        crop_path = output_dir / f"{stem}_barcode_{saved_index:02d}.jpg"
         cv2.imwrite(str(crop_path), crop)
 
         entry = {
-            "index": index,
+            "index": saved_index,
             "crop_path": str(crop_path),
             "crop": crop,
             "region": region,
@@ -310,11 +335,12 @@ def process_image(
                 entry["decoded"] = result
                 entry["text"] = result.text
                 entry["type"] = result.barcode_type
-                oriented_path = output_dir / f"{stem}_barcode_{index:02d}_oriented.jpg"
+                oriented_path = output_dir / f"{stem}_barcode_{saved_index:02d}_oriented.jpg"
                 cv2.imwrite(str(oriented_path), result.oriented_image)
                 entry["oriented_path"] = str(oriented_path)
 
         barcodes.append(entry)
+        saved_index += 1
 
     labels = [(b["text"] if b["text"] else "?") for b in barcodes]
     return {
