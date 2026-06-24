@@ -25,20 +25,20 @@ Place pre-cropped images (any rotation) in `manual_cropping/`, then run the note
 
 Orientation is handled in `barcode_orient_decode.py` via `orient_and_decode()`.
 
-1. **Binary threshold and edges** — The crop is converted to grayscale, binarised with Otsu, then passed through Canny edge detection to highlight barcode bar edges.
-2. **Stripe zone vs text below** — The image is split into a top stripe zone (barcode bars) and a lower zone (human-readable text). This keeps deskew focused on bar edges, not text below.
-3. **Edge-based deskew** — Hough line segments are detected in each zone. A coarse rotation search picks an angle where stripe edges outnumber edges below. A fine search then adjusts in 0.1 degree steps to minimise how far stripe edges deviate from exactly 90 degrees vertical.
-4. **Cardinal rotation** — The deskewed image is tested at 0, 90, 180, and 270 degrees so pyzbar can read axis-aligned barcodes regardless of initial orientation.
-5. **Visual upright correction** — pyzbar reports an orientation flag (`UP`, `DOWN`, `LEFT`, `RIGHT`). An additional rotation is applied so the output image is visually upright with bars vertical and text at the bottom.
-6. **Fallback** — If edge deskew plus decode still fails, a brute-force sweep from -90 to 90 degrees is used. The result with the smallest total rotation is preferred.
+1. **Binary threshold and edges** - The crop is converted to grayscale, binarised with Otsu, then passed through Canny edge detection to highlight barcode bar edges.
+2. **Stripe zone vs text below** - The image is split into a top stripe zone (barcode bars) and a lower zone (human-readable text). This keeps deskew focused on bar edges, not text below.
+3. **Edge-based deskew** - Hough line segments are detected in each zone. A coarse rotation search picks an angle where stripe edges outnumber edges below. A fine search then adjusts in 0.1 degree steps to minimise how far stripe edges deviate from exactly 90 degrees vertical.
+4. **Cardinal rotation** - The deskewed image is tested at 0, 90, 180, and 270 degrees so pyzbar can read axis-aligned barcodes regardless of initial orientation.
+5. **Visual upright correction** - pyzbar reports an orientation flag (`UP`, `DOWN`, `LEFT`, `RIGHT`). An additional rotation is applied so the output image is visually upright with bars vertical and text at the bottom.
+6. **Fallback** - If edge deskew plus decode still fails, a brute-force sweep from -90 to 90 degrees is used. The result with the smallest total rotation is preferred.
 
 ## Decoding Logic
 
 Decoding is performed with **pyzbar** in `decode_barcode()`.
 
-1. **Preprocessing variants** — Each image is tried as raw grayscale, CLAHE-enhanced, Otsu-binarised, and upscaled (1.5x and 2x) to handle low contrast, blur, and small barcodes.
-2. **First successful decode wins** — Variants are passed to `pyzbar.decode()` in order until a barcode is found.
-3. **Output** — A `DecodeResult` is returned containing the decoded text, barcode type, total rotation applied, and the upright oriented image.
+1. **Preprocessing variants** - Each image is tried as raw grayscale, CLAHE-enhanced, Otsu-binarised, and upscaled (1.5x and 2x) to handle low contrast, blur, and small barcodes.
+2. **First successful decode wins** - Variants are passed to `pyzbar.decode()` in order until a barcode is found.
+3. **Output** - A `DecodeResult` is returned containing the decoded text, barcode type, total rotation applied, and the upright oriented image.
 
 In `main.ipynb`, `orient_and_decode()` is called directly on each manual crop. In the auto pipeline, a fast path attempts direct decode on the crop first; full orientation runs only when needed.
 
