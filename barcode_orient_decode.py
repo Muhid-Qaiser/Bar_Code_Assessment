@@ -113,27 +113,72 @@ def _bar_edge_counts(gray: np.ndarray) -> tuple[int, int]:
     return aligned_lines(stripe), aligned_lines(below)
 
 
+def _stripe_vertical_deviation(gray: np.ndarray) -> tuple[float, int, int]:
+    """Mean deviation of stripe edges from 90 degrees; requires stripe edges to exceed below."""
+    stripe_n, below_n = _bar_edge_counts(gray)
+    if stripe_n <= below_n:
+        return float("inf"), stripe_n, below_n
+
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    edges = cv2.Canny(binary, 50, 150)
+    h = edges.shape[0]
+    split = max(1, int(h * 0.7))
+    stripe = edges[:split]
+    min_len = max(8, stripe.shape[1] // 20)
+    lines = cv2.HoughLinesP(
+        stripe, 1, np.pi / 180, threshold=12,
+        minLineLength=min_len, maxLineGap=6,
+    )
+    if lines is None:
+        return float("inf"), stripe_n, below_n
+
+    total_w = 0.0
+    weighted_dev = 0.0
+    for x1, y1, x2, y2 in lines[:, 0]:
+        angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+        if abs(angle) < 45:
+            continue
+        length = float(np.hypot(x2 - x1, y2 - y1))
+        weighted_dev += abs(abs(angle) - 90.0) * length
+        total_w += length
+
+    if total_w < 1.0:
+        return float("inf"), stripe_n, below_n
+    return weighted_dev / total_w, stripe_n, below_n
+
+
 def _edge_deskew_angle(image: np.ndarray) -> float:
-    """Rotate so stripe edges are straight and outnumber edges below the bars."""
+    """Rotate so stripe edges are exactly vertical and outnumber edges below the bars."""
     gray = _to_gray(image)
-    best_angle = 0.0
-    best_key = (-1, -1)
+    coarse = 0.0
+    coarse_dev = float("inf")
 
     for angle in range(-45, 46, 2):
         rotated = _rotate_image(gray, float(angle), expand=True)
-        stripe_n, below_n = _bar_edge_counts(rotated)
-        key = (stripe_n - below_n, stripe_n)
-        if stripe_n > below_n and key > best_key:
-            best_key = key
-            best_angle = float(angle)
+        dev, _, _ = _stripe_vertical_deviation(rotated)
+        if dev < coarse_dev:
+            coarse_dev = dev
+            coarse = float(angle)
 
-    if best_key[0] < 0:
+    if coarse_dev == float("inf"):
+        best_key = (-1, -1)
         for angle in range(-45, 46, 2):
             rotated = _rotate_image(gray, float(angle), expand=True)
             stripe_n, below_n = _bar_edge_counts(rotated)
-            if stripe_n > best_key[1]:
-                best_key = (stripe_n - below_n, stripe_n)
-                best_angle = float(angle)
+            key = (stripe_n - below_n, stripe_n)
+            if stripe_n > below_n and key > best_key:
+                best_key = key
+                coarse = float(angle)
+
+    best_angle = coarse
+    best_dev = coarse_dev
+    for step in range(-30, 31):
+        angle = coarse + step / 10.0
+        rotated = _rotate_image(gray, angle, expand=True)
+        dev, _, _ = _stripe_vertical_deviation(rotated)
+        if dev < best_dev:
+            best_dev = dev
+            best_angle = angle
 
     return best_angle
 

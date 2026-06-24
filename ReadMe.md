@@ -27,7 +27,7 @@ Orientation is handled in `barcode_orient_decode.py` via `orient_and_decode()`.
 
 1. **Binary threshold and edges** — The crop is converted to grayscale, binarised with Otsu, then passed through Canny edge detection to highlight barcode bar edges.
 2. **Stripe zone vs text below** — The image is split into a top stripe zone (barcode bars) and a lower zone (human-readable text). This keeps deskew focused on bar edges, not text below.
-3. **Edge-based deskew** — Hough line segments are counted in each zone. Straight bar edges are nearly horizontal or vertical. The image is rotated over a range of angles and the best angle is chosen where aligned stripe edges outnumber edges in the text zone below.
+3. **Edge-based deskew** — Hough line segments are detected in each zone. A coarse rotation search picks an angle where stripe edges outnumber edges below. A fine search then adjusts in 0.1 degree steps to minimise how far stripe edges deviate from exactly 90 degrees vertical.
 4. **Cardinal rotation** — The deskewed image is tested at 0, 90, 180, and 270 degrees so pyzbar can read axis-aligned barcodes regardless of initial orientation.
 5. **Visual upright correction** — pyzbar reports an orientation flag (`UP`, `DOWN`, `LEFT`, `RIGHT`). An additional rotation is applied so the output image is visually upright with bars vertical and text at the bottom.
 6. **Fallback** — If edge deskew plus decode still fails, a brute-force sweep from -90 to 90 degrees is used. The result with the smallest total rotation is preferred.
@@ -104,9 +104,14 @@ I moved to edge-based deskewing, which worked better on my manual crops.
 3. Split the crop into a top stripe zone (bars) and a lower text zone
 4. Hough lines in each zone; count edges that are nearly horizontal or vertical
 5. Search rotation angles and pick the one where straight bar edges in the stripe zone outnumber edges in the text zone below
-6. Keep the same decode step: cardinal rotations plus pyzbar orientation correction for visual upright output
+6. Fine tune the deskew angle in 0.1 degree steps so bar edges are as close to exactly vertical (90 degrees) as possible
+7. Keep the same decode step: cardinal rotations plus pyzbar orientation correction for visual upright output
 
 This aligns rotation with the actual barcode line edges rather than a loose bounding contour, which is why the results looked better.
+
+**Refining the angle**
+
+The first edge-based version oriented barcodes well but was still off by a few degrees because the coarse search used 2 degree steps. I added a second pass that searches plus or minus 3 degrees around the best coarse angle in 0.1 degree steps, scoring each candidate by mean deviation of stripe edge lines from exactly 90 degrees. This removed the small remaining tilt without changing the decode logic.
 
 **What I tried in between but moved away from**
 
@@ -139,5 +144,5 @@ The pipeline stops at the first variant pyzbar can read. This improved recall wi
 
 ### Results
 
-On my manual crop set in `manual_cropping/` (27 images), the final edge-based orient and decode pipeline decodes every image and produces visually upright barcodes with vertical bars. The contour-based deskew was a useful starting point, but edge-based straightening gave the most consistent visual results. The main lesson for me was that decode success and visual correctness are not the same problem, and measuring bar edges directly was the key to getting both right.
+On my manual crop set in `manual_cropping/` (27 images), the final edge-based orient and decode pipeline decodes every image and produces visually upright barcodes with vertical bars aligned to within about 1 degree of true vertical after deskew. The contour-based deskew was a useful starting point, but edge-based straightening with fine angle tuning gave the most consistent visual results. The main lesson for me was that decode success and visual correctness are not the same problem, and measuring bar edges directly was the key to getting both right.
 
