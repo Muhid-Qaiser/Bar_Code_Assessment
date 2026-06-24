@@ -79,6 +79,65 @@ def _barcode_mask(gray: np.ndarray) -> np.ndarray:
     )
 
 
+def _to_gray(image: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+
+
+def _bar_edge_counts(gray: np.ndarray) -> tuple[int, int]:
+    """Count aligned bar edges in stripe zone vs edge lines in text zone below."""
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    edges = cv2.Canny(binary, 50, 150)
+    h = edges.shape[0]
+    split = max(1, int(h * 0.7))
+    stripe = edges[:split]
+    below = edges[split:]
+
+    def aligned_lines(region: np.ndarray) -> int:
+        if region.size == 0:
+            return 0
+        min_len = max(8, region.shape[1] // 20)
+        lines = cv2.HoughLinesP(
+            region, 1, np.pi / 180, threshold=12,
+            minLineLength=min_len, maxLineGap=6,
+        )
+        if lines is None:
+            return 0
+        count = 0
+        for x1, y1, x2, y2 in lines[:, 0]:
+            angle = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
+            angle = min(angle, 180.0 - angle)
+            if angle <= 15 or angle >= 75:
+                count += 1
+        return count
+
+    return aligned_lines(stripe), aligned_lines(below)
+
+
+def _edge_deskew_angle(image: np.ndarray) -> float:
+    """Rotate so stripe edges are straight and outnumber edges below the bars."""
+    gray = _to_gray(image)
+    best_angle = 0.0
+    best_key = (-1, -1)
+
+    for angle in range(-45, 46, 2):
+        rotated = _rotate_image(gray, float(angle), expand=True)
+        stripe_n, below_n = _bar_edge_counts(rotated)
+        key = (stripe_n - below_n, stripe_n)
+        if stripe_n > below_n and key > best_key:
+            best_key = key
+            best_angle = float(angle)
+
+    if best_key[0] < 0:
+        for angle in range(-45, 46, 2):
+            rotated = _rotate_image(gray, float(angle), expand=True)
+            stripe_n, below_n = _bar_edge_counts(rotated)
+            if stripe_n > best_key[1]:
+                best_key = (stripe_n - below_n, stripe_n)
+                best_angle = float(angle)
+
+    return best_angle
+
+
 def find_barcode_contour(image: np.ndarray) -> np.ndarray | None:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
     mask = _barcode_mask(gray)
@@ -88,37 +147,11 @@ def find_barcode_contour(image: np.ndarray) -> np.ndarray | None:
     return max(contours, key=cv2.contourArea)
 
 
-def _correct_min_area_angle(angle: float) -> float:
-    # minAreaRect angles from -90 to 0, convert to deskew rotation.
-    if angle < -45:
-        return -(90 + angle)
-    return -angle
-
-
-def _deskew_candidates(contour: np.ndarray) -> list[float]:
-    """Deskew angle candidates, handles minAreaRect 90 degree ambiguity."""
-    rect = cv2.minAreaRect(contour)
-    angle = _correct_min_area_angle(rect[-1])
-    w, h = rect[1]
-    if max(w, h) < 1:
-        return [angle]
-
-    candidates = [angle]
-    if min(w, h) / max(w, h) > 0.55:  # near square 90 degree ambiguity
-        candidates.extend([angle + 90.0, angle - 90.0])
-    return candidates
-
-
 def straighten_barcode(
     cropped_image: np.ndarray,
     contour: np.ndarray | None = None,
 ) -> tuple[np.ndarray, float, np.ndarray | None]:
-    if contour is None:
-        contour = find_barcode_contour(cropped_image)
-    if contour is None:
-        return cropped_image.copy(), 0.0, None
-
-    angle = _deskew_candidates(contour)[0]
+    angle = _edge_deskew_angle(cropped_image)
     return _rotate_image(cropped_image, angle, expand=True), angle, contour
 
 
@@ -214,31 +247,10 @@ def _fallback_angle_search(image: np.ndarray) -> DecodeResult | None:
 
 
 def orient_and_decode(image: np.ndarray) -> DecodeResult | None:
-    """Deskew, decode, and return a visually upright barcode image."""
-    contour = find_barcode_contour(image)
-    if contour is None:
-        return _fallback_angle_search(image)
-
-    # Try each deskew candidate and keep the result needing least rotation.
-    best: DecodeResult | None = None
-    best_score = float("inf")
-
-    for deskew_angle in _deskew_candidates(contour):
-        straightened = _rotate_image(image, deskew_angle, expand=True)
-        result = _decode_upright(straightened, deskew_angle, image)
-        if result is None:
-            continue
-
-        if abs(result.rotation_angle) < best_score:  # pick smallest total rotation
-            best_score = abs(result.rotation_angle)
-            result.contour = contour
-            best = result
-
-    if best is not None:
-        return best
-
-    # Contour found but decode failed, fall back to angle search.
-    fallback = _fallback_angle_search(image)
-    if fallback is not None:
-        fallback.contour = contour
-    return fallback
+    """Deskew by edge alignment, decode, and return a visually upright barcode image."""
+    deskew_angle = _edge_deskew_angle(image)
+    straightened = _rotate_image(image, deskew_angle, expand=True)
+    result = _decode_upright(straightened, deskew_angle, image)
+    if result is not None:
+        return result
+    return _fallback_angle_search(image)
