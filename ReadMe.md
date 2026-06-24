@@ -4,7 +4,7 @@ A classical computer vision pipeline for orienting and decoding 1D barcodes from
 
 ## Main Entry Point
 
-The primary workflow is `**main.ipynb**`. It processes manually cropped barcode images from `manual_cropping/` through orientation and decoding. This notebook uses `barcode_orient_decode.py` only and does not perform automatic detection.
+The primary workflow is `main.ipynb`. It processes manually cropped barcode images from `manual_cropping/` through orientation and decoding. This notebook uses `barcode_orient_decode.py` only and does not perform automatic detection.
 
 Place pre-cropped images (any rotation) in `manual_cropping/`, then run the notebook to produce upright, decoded results.
 
